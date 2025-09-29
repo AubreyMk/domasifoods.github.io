@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Search,
   Home,
@@ -8,278 +8,9 @@ import {
   Clock,
 } from 'lucide-react';
 
-// === Google Sheets Integration Classes ===
 const BASE_IMAGE_URL = 'http://localhost:3000/img';
 
-class GoogleSheetsService {
-  constructor(apiKey, sheetId) {
-    this.apiKey = apiKey;
-    this.sheetId = sheetId;
-    this.baseUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`;
-  }
-
-  async getSheetData(range = 'Sheet1!A:G') {
-    try {
-      const response = await fetch(
-        `${this.baseUrl}/values/${range}?key=${this.apiKey}`
-      );
-      const data = await response.json();
-      return data.values || [];
-    } catch (error) {
-      console.error('Error fetching sheet data:', error);
-      throw error;
-    }
-  }
-
-  parseSheetData(sheetData) {
-    if (!sheetData || sheetData.length < 2) return { restaurants: [], menuItems: {} };
-
-    const restaurants = new Map();
-    const menuItems = {};
-
-    rows.forEach((row) => {
-      if (row.length < 7) return;
-
-      const [
-        restaurantName,
-        itemName,
-        price,
-        category,
-        description,
-        imageUrl,
-        available,
-        restaurantLocation,
-        restaurantSpecialty,
-        restaurantRating,
-        restaurantImage,
-      ] = row;
-
-      // Create restaurant entry
-      if (!restaurants.has(restaurantName)) {
-        const restaurantId = this.generateId(restaurantName);
-        restaurants.set(restaurantName, {
-          id: restaurantId,
-          name: restaurantName,
-          location: restaurantLocation || 'Malawi',
-          specialty: restaurantSpecialty || 'Malawian Cuisine',
-          rating: parseFloat(restaurantRating) || 4.5,
-          image:
-            restaurantImage ||
-            'https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=300&h=200&fit=crop',
-        });
-        menuItems[restaurantId] = [];
-      }
-
-      // Add menu item
-      const restaurantId = restaurants.get(restaurantName).id;
-
-      menuItems[restaurantId].push({
-        id: this.generateId(itemName + restaurantName),
-        name: itemName,
-        price: price,
-        category: category || 'Main Dishes',
-        description: description || '',
-        image: imageUrl 
-        ? `${BASE_IMAGE_URL}/${imageUrl.trim()}`
-        : `${BASE_IMAGE_URL}/placeholder.jpg`,       
-         available: available !== 'FALSE'
-      });
-    });
-
-    return {
-      restaurants: Array.from(restaurants.values()),
-      menuItems,
-    };
-  }
-
-  generateId(text) {
-    return (
-      text.toLowerCase().replace(/[^a-z0-9]/g, '') + Date.now().toString().slice(-4)
-    );
-  }
-}
-
-class MenuSyncService {
-  constructor(apiBaseUrl, googleSheetsService) {
-    this.apiBaseUrl = apiBaseUrl;
-    this.sheetsService = googleSheetsService;
-  }
-
-  async syncFromGoogleSheets() {
-    try {
-      console.log('🔄 Starting sync from Google Sheets...');
-      const sheetData = await this.sheetsService.getSheetData();
-      const parsedData = this.sheetsService.parseSheetData(sheetData);
-
-      console.log(`📊 Found ${parsedData.restaurants.length} restaurants with menus`);
-
-      for (const restaurant of parsedData.restaurants) {
-        await this.syncRestaurant(restaurant, parsedData.menuItems[restaurant.id]);
-      }
-
-      console.log('✅ Sync completed successfully!');
-      return parsedData;
-    } catch (error) {
-      console.error('❌ Sync failed:', error);
-      throw error;
-    }
-  }
-
-  async syncRestaurant(restaurantData, menuItems) {
-    try {
-      const existingRestaurant = await this.findRestaurantByName(restaurantData.name);
-      let restaurantId;
-
-      if (existingRestaurant) {
-        restaurantId = existingRestaurant.id;
-        await this.updateRestaurant(restaurantId, restaurantData);
-        console.log(`📝 Updated restaurant: ${restaurantData.name}`);
-      } else {
-        const newRestaurant = await this.createRestaurant(restaurantData);
-        restaurantId = newRestaurant.id;
-        console.log(`🆕 Created restaurant: ${restaurantData.name}`);
-      }
-
-      if (menuItems && menuItems.length > 0) {
-        await this.syncMenuItems(restaurantId, menuItems);
-      }
-    } catch (error) {
-      console.error(`Error syncing restaurant ${restaurantData.name}:`, error);
-    }
-  }
-
-  async findRestaurantByName(name) {
-    try {
-      const response = await fetch(
-        `${this.apiBaseUrl}/search/restaurants?q=${encodeURIComponent(name)}`
-      );
-      const data = await response.json();
-      return data.data?.find((r) => r.name.toLowerCase() === name.toLowerCase());
-    } catch (error) {
-      return null;
-    }
-  }
-
-  async createRestaurant(restaurantData) {
-    const response = await fetch(`${this.apiBaseUrl}/restaurants`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(restaurantData),
-    });
-    const result = await response.json();
-    if (!result.success) throw new Error(result.message);
-    return result.data;
-  }
-
-  async updateRestaurant(id, restaurantData) {
-    const response = await fetch(`${this.apiBaseUrl}/restaurants/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(restaurantData),
-    });
-    const result = await response.json();
-    if (!result.success) throw new Error(result.message);
-    return result.data;
-  }
-
-  async syncMenuItems(restaurantId, menuItems) {
-    try {
-      const menusResponse = await fetch(
-        `${this.apiBaseUrl}/restaurants/${restaurantId}/menus`
-      );
-      const menusData = await menusResponse.json();
-
-      let menuId;
-      if (menusData.data?.length > 0) {
-        menuId = menusData.data[0].id;
-      } else {
-        const menuResponse = await fetch(
-          `${this.apiBaseUrl}/restaurants/${restaurantId}/menus`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: 'Main Menu',
-              description: 'Restaurant menu from Google Sheets',
-              is_active: true,
-            }),
-          }
-        );
-        const menuResult = await menuResponse.json();
-        menuId = menuResult.data.id;
-      }
-
-      const response = await fetch(`${this.apiBaseUrl}/menus/${menuId}/items/bulk`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: menuItems }),
-      });
-
-      const result = await response.json();
-      if (!result.success) throw new Error(result.message);
-
-      console.log(`📋 Synced ${menuItems.length} menu items`);
-      return result.data;
-    } catch (error) {
-      console.error('Error syncing menu items:', error);
-      throw error;
-    }
-  }
-}
-
-// === Custom Hook: useGoogleSheetsMenu ===
-export const useGoogleSheetsMenu = (apiKey, sheetId, apiBaseUrl) => {
-  const [restaurants, setRestaurants] = useState([]);
-  const [menuItems, setMenuItems] = useState({});
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const [lastSync, setLastSync] = useState(null);
-
-  const syncData = useCallback(async () => {
-    if (!apiKey || !sheetId || !apiBaseUrl) {
-      console.log('Missing API configuration, using fallback data');
-      return;
-    }
-
-    try {
-      setLoading(true);
-      setError(null);
-
-      const sheetsService = new GoogleSheetsService(apiKey, sheetId);
-      const syncService = new MenuSyncService(apiBaseUrl, sheetsService);
-      const data = await syncService.syncFromGoogleSheets();
-      
-      setRestaurants(data.restaurants);
-      setMenuItems(data.menuItems);
-      setLastSync(new Date());
-    } catch (err) {
-      setError(err.message);
-      console.error('Sync error:', err);
-    } finally {
-      setLoading(false);
-    }
-  }, [apiKey, sheetId, apiBaseUrl]);
-
-  useEffect(() => {
-    syncData();
-  }, [syncData]);
-
-  useEffect(() => {
-    const interval = setInterval(syncData, 5 * 60 * 1000);
-    return () => clearInterval(interval);
-  }, [syncData]);
-
-  return {
-    restaurants,
-    menuItems,
-    loading,
-    error,
-    lastSync,
-    manualSync: syncData,
-  };
-};
-
-// === Fallback Data (for when Google Sheets is unavailable) ===
+// === Fallback Data ===
 const FALLBACK_RESTAURANTS = [
   {
     id: 1,
@@ -287,8 +18,7 @@ const FALLBACK_RESTAURANTS = [
     location: 'Blantyre City Centre',
     specialty: 'Traditional Malawian',
     rating: 4.8,
-    image:
-      'https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=300&h=200&fit=crop',
+    image: 'https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=300&h=200&fit=crop',
   },
   {
     id: 2,
@@ -296,8 +26,7 @@ const FALLBACK_RESTAURANTS = [
     location: 'Area 47, Lilongwe',
     specialty: 'Grilled Meats',
     rating: 4.6,
-    image:
-      'https://images.unsplash.com/photo-1558030006-450675393462?w=300&h=200&fit=crop',
+    image: 'https://images.unsplash.com/photo-1558030006-450675393462?w=300&h=200&fit=crop',
   },
   {
     id: 3,
@@ -305,26 +34,7 @@ const FALLBACK_RESTAURANTS = [
     location: 'Mangochi',
     specialty: 'Fish & Traditional',
     rating: 4.5,
-    image:
-      'https://images.unsplash.com/photo-1544148103-0773bf10d330?w=300&h=200&fit=crop',
-  },
-  {
-    id: 4,
-    name: 'Spice Garden',
-    location: 'Mzuzu',
-    specialty: 'Fusion Cuisine',
-    rating: 4.7,
-    image:
-      'https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?w=300&h=200&fit=crop',
-  },
-  {
-    id: 5,
-    name: 'Village Taste',
-    location: 'Zomba',
-    specialty: 'Home Style Cooking',
-    rating: 4.9,
-    image:
-      'https://images.unsplash.com/photo-1590846406792-0adc7f938f1d?w=300&h=200&fit=crop',
+    image: 'https://images.unsplash.com/photo-1544148103-0773bf10d330?w=300&h=200&fit=crop',
   },
 ];
 
@@ -335,8 +45,7 @@ const FALLBACK_MENU_ITEMS = {
       name: 'Nsima with Ndiwo',
       price: 'MK 1,500',
       category: 'Main Dishes',
-      image:
-        'https://images.unsplash.com/photo-1586511925558-a4c6376fe65f?w=400&h=300&fit=crop',
+      image: 'https://images.unsplash.com/photo-1586511925558-a4c6376fe65f?w=400&h=300&fit=crop',
       description: 'Traditional nsima with choice of relish (ndiwo)',
     },
     {
@@ -344,19 +53,17 @@ const FALLBACK_MENU_ITEMS = {
       name: 'Chambo with Rice',
       price: 'MK 2,800',
       category: 'Fish Dishes',
-      image:
-        'https://images.unsplash.com/photo-1544943910-4c1dc44aab44?w=400&h=300&fit=crop',
+      image: 'https://images.unsplash.com/photo-1544943910-4c1dc44aab44?w=400&h=300&fit=crop',
       description: 'Fresh chambo fish grilled with spices',
     },
   ],
   2: [
     {
       id: 4,
-      name: 'Nyama ya Ng\'ombe',
+      name: "Nyama ya Ng'ombe",
       price: 'MK 3,200',
       category: 'Grilled Meats',
-      image:
-        'https://images.unsplash.com/photo-1544025162-d76694265947?w=400&h=300&fit=crop',
+      image: 'https://images.unsplash.com/photo-1544025162-d76694265947?w=400&h=300&fit=crop',
       description: 'Grilled beef with nsima and vegetables',
     },
   ],
@@ -367,39 +74,130 @@ const POPULAR_DISHES = [
     id: 1,
     title: 'Traditional Nsima Experience',
     description: 'Discover authentic Malawian cuisine with our traditional nsima dishes',
-    image:
-      'https://images.unsplash.com/photo-1586511925558-a4c6376fe65f?w=400&h=200&fit=crop',
+    image: 'https://images.unsplash.com/photo-1586511925558-a4c6376fe65f?w=400&h=200&fit=crop',
   },
   {
     id: 2,
     title: 'Fresh Lake Fish',
     description: 'Enjoy the finest chambo and other fish from Lake Malawi',
-    image:
-      'https://images.unsplash.com/photo-1544943910-4c1dc44aab44?w=400&h=200&fit=crop',
+    image: 'https://images.unsplash.com/photo-1544943910-4c1dc44aab44?w=400&h=200&fit=crop',
   },
   {
     id: 3,
     title: 'Local Specialties',
     description: 'Taste unique Malawian flavors and traditional cooking methods',
-    image:
-      'https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=400&h=200&fit=crop',
+    image: 'https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=400&h=200&fit=crop',
   },
 ];
 
+// === Google Sheets Service ===
+const useGoogleSheets = (apiKey, sheetId) => {
+  const [data, setData] = useState({ restaurants: [], menuItems: {} });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const fetchSheetData = useCallback(async () => {
+    if (!apiKey || !sheetId) {
+      console.log('No API credentials provided, using fallback data');
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+
+      const baseUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`;
+      const range = 'Sheet1!A:K';
+      const url = `${baseUrl}/values/${range}?key=${apiKey}`;
+
+      const response = await fetch(url);
+      const result = await response.json();
+
+      if (!result.values || result.values.length < 2) {
+        throw new Error('No data found in sheet');
+      }
+
+      const rows = result.values.slice(1);
+      const restaurantsMap = new Map();
+      const menuItemsMap = {};
+
+      rows.forEach((row) => {
+        if (row.length < 7) return;
+
+        const [
+          restaurantName,
+          itemName,
+          price,
+          category,
+          description,
+          imageUrl,
+          available,
+          restaurantLocation,
+          restaurantSpecialty,
+          restaurantRating,
+          restaurantImage,
+        ] = row;
+
+        if (!restaurantsMap.has(restaurantName)) {
+          const restaurantId = `${restaurantName.toLowerCase().replace(/[^a-z0-9]/g, '')}_${Date.now()}`;
+          restaurantsMap.set(restaurantName, {
+            id: restaurantId,
+            name: restaurantName,
+            location: restaurantLocation || 'Malawi',
+            specialty: restaurantSpecialty || 'Malawian Cuisine',
+            rating: parseFloat(restaurantRating) || 4.5,
+            image: restaurantImage || 'https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=300&h=200&fit=crop',
+          });
+          menuItemsMap[restaurantId] = [];
+        }
+
+        const restaurantId = restaurantsMap.get(restaurantName).id;
+        const itemId = `${itemName.toLowerCase().replace(/[^a-z0-9]/g, '')}_${Date.now()}`;
+
+        menuItemsMap[restaurantId].push({
+          id: itemId,
+          name: itemName,
+          price: price,
+          category: category || 'Main Dishes',
+          description: description || '',
+          image: imageUrl ? `${BASE_IMAGE_URL}/${imageUrl.trim()}` : `${BASE_IMAGE_URL}/placeholder.jpg`,
+          available: available !== 'FALSE',
+        });
+      });
+
+      setData({
+        restaurants: Array.from(restaurantsMap.values()),
+        menuItems: menuItemsMap,
+      });
+    } catch (err) {
+      setError(err.message);
+      console.error('Error fetching Google Sheets data:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, [apiKey, sheetId]);
+
+  useEffect(() => {
+    fetchSheetData();
+  }, [fetchSheetData]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchSheetData();
+    }, 5 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, [fetchSheetData]);
+
+  return { data, loading, error, refresh: fetchSheetData };
+};
+
 // === Main Component ===
 const MalawianRestaurantApp = () => {
-  const {
-    restaurants: sheetRestaurants,
-    menuItems: sheetMenuItems,
-    loading: syncLoading,
-    error: syncError,
-    lastSync,
-    manualSync,
-  } = useGoogleSheetsMenu(
-    process.env.REACT_APP_GOOGLE_SHEETS_API_KEY,
-    process.env.REACT_APP_GOOGLE_SHEETS_ID,
-    process.env.REACT_APP_API_BASE_URL || 'http://localhost:3000/api'
-  );
+  const apiKey = process.env.REACT_APP_GOOGLE_SHEETS_API_KEY;
+  const sheetId = process.env.REACT_APP_GOOGLE_SHEETS_ID;
+
+  const { data: sheetData, loading: syncLoading, error: syncError, refresh } = useGoogleSheets(apiKey, sheetId);
 
   const [activeTab, setActiveTab] = useState('home');
   const [selectedRestaurant, setSelectedRestaurant] = useState(null);
@@ -407,15 +205,22 @@ const MalawianRestaurantApp = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [showRestaurantPanel, setShowRestaurantPanel] = useState(false);
 
-  const restaurants = sheetRestaurants.length > 0 ? sheetRestaurants : FALLBACK_RESTAURANTS;
-  const menuItems = Object.keys(sheetMenuItems).length > 0 ? sheetMenuItems : FALLBACK_MENU_ITEMS;
+  const restaurants = useMemo(() => {
+    return sheetData.restaurants.length > 0 ? sheetData.restaurants : FALLBACK_RESTAURANTS;
+  }, [sheetData.restaurants]);
 
-  const filteredRestaurants = restaurants.filter(
-    (restaurant) =>
-      restaurant.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      restaurant.specialty.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      restaurant.location.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const menuItems = useMemo(() => {
+    return Object.keys(sheetData.menuItems).length > 0 ? sheetData.menuItems : FALLBACK_MENU_ITEMS;
+  }, [sheetData.menuItems]);
+
+  const filteredRestaurants = useMemo(() => {
+    return restaurants.filter(
+      (restaurant) =>
+        restaurant.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        restaurant.specialty.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        restaurant.location.toLowerCase().includes(searchTerm.toLowerCase())
+    );
+  }, [restaurants, searchTerm]);
 
   const MenuItem = ({ item, onClick }) => (
     <div
@@ -451,12 +256,7 @@ const MalawianRestaurantApp = () => {
             className="absolute top-2 right-2 bg-white rounded-full p-1 hover:bg-gray-100"
           >
             <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M6 18L18 6M6 6l12 12"
-              />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
         </div>
@@ -629,12 +429,7 @@ const MalawianRestaurantApp = () => {
           onClick={() => setShowRestaurantPanel(false)}
         >
           <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M6 18L18 6M6 6l12 12"
-            />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
           </svg>
         </button>
 
@@ -708,29 +503,36 @@ const MalawianRestaurantApp = () => {
     </div>
   );
 
-  const SyncStatus = () => (
-    <div className="fixed top-4 right-4 z-50">
-      {syncLoading && (
-        <div className="bg-blue-500 text-white px-3 py-2 rounded-lg shadow-lg flex items-center">
-          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
-          Syncing menus...
-        </div>
-      )}
-      {syncError && (
-        <div className="bg-red-500 text-white px-3 py-2 rounded-lg shadow-lg">
-          Sync failed: {syncError}
-        </div>
-      )}
-      {lastSync && !syncLoading && !syncError && (
-        <div className="bg-green-500 text-white px-3 py-2 rounded-lg shadow-lg text-sm">
-          Last sync: {lastSync.toLocaleTimeString()}
-          <button onClick={manualSync} className="ml-2 underline hover:no-underline">
-            Refresh
-          </button>
-        </div>
-      )}
-    </div>
-  );
+  const SyncStatus = () => {
+    if (!syncLoading && !syncError && !sheetData.restaurants.length) return null;
+
+    return (
+      <div className="fixed top-4 right-4 z-50">
+        {syncLoading && (
+          <div className="bg-blue-500 text-white px-3 py-2 rounded-lg shadow-lg flex items-center text-sm">
+            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+            Syncing...
+          </div>
+        )}
+        {syncError && (
+          <div className="bg-yellow-500 text-white px-3 py-2 rounded-lg shadow-lg text-sm">
+            Using offline data
+            <button onClick={refresh} className="ml-2 underline hover:no-underline">
+              Retry
+            </button>
+          </div>
+        )}
+        {!syncLoading && !syncError && sheetData.restaurants.length > 0 && (
+          <div className="bg-green-500 text-white px-3 py-2 rounded-lg shadow-lg text-sm">
+            ✓ Synced
+            <button onClick={refresh} className="ml-2 underline hover:no-underline">
+              Refresh
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="min-h-screen bg-gray-50">
