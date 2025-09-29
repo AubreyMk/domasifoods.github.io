@@ -34,7 +34,6 @@ class GoogleSheetsService {
   parseSheetData(sheetData) {
     if (!sheetData || sheetData.length < 2) return { restaurants: [], menuItems: {} };
 
-    const [headers, ...rows] = sheetData;
     const restaurants = new Map();
     const menuItems = {};
 
