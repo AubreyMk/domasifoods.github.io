@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Search,
   Home,
@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 
 // === Google Sheets Integration Classes ===
-  const BASE_IMAGE_URL = 'http://localhost:3000/img';
+const BASE_IMAGE_URL = 'http://localhost:3000/img';
 
 class GoogleSheetsService {
   constructor(apiKey, sheetId) {
@@ -74,9 +74,6 @@ class GoogleSheetsService {
       // Add menu item
       const restaurantId = restaurants.get(restaurantName).id;
 
-            // Add this as a class property or constant
-
-      // Inside parseSheetData, when adding a menu item:
       menuItems[restaurantId].push({
         id: this.generateId(itemName + restaurantName),
         name: itemName,
@@ -84,7 +81,7 @@ class GoogleSheetsService {
         category: category || 'Main Dishes',
         description: description || '',
         image: imageUrl 
-        ? `${BASE_IMAGE_URL}/${imageUrl.trim()}` // ← Use BASE_IMAGE_URL directly
+        ? `${BASE_IMAGE_URL}/${imageUrl.trim()}`
         : `${BASE_IMAGE_URL}/placeholder.jpg`,       
          available: available !== 'FALSE'
       });
@@ -239,15 +236,20 @@ export const useGoogleSheetsMenu = (apiKey, sheetId, apiBaseUrl) => {
   const [error, setError] = useState(null);
   const [lastSync, setLastSync] = useState(null);
 
-  const sheetsService = new GoogleSheetsService(apiKey, sheetId);
-  const syncService = new MenuSyncService(apiBaseUrl, sheetsService);
+  const syncData = useCallback(async () => {
+    if (!apiKey || !sheetId || !apiBaseUrl) {
+      console.log('Missing API configuration, using fallback data');
+      return;
+    }
 
-  const syncData = async () => {
     try {
       setLoading(true);
       setError(null);
 
+      const sheetsService = new GoogleSheetsService(apiKey, sheetId);
+      const syncService = new MenuSyncService(apiBaseUrl, sheetsService);
       const data = await syncService.syncFromGoogleSheets();
+      
       setRestaurants(data.restaurants);
       setMenuItems(data.menuItems);
       setLastSync(new Date());
@@ -257,16 +259,16 @@ export const useGoogleSheetsMenu = (apiKey, sheetId, apiBaseUrl) => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [apiKey, sheetId, apiBaseUrl]);
 
   useEffect(() => {
     syncData();
-  }, []);
+  }, [syncData]);
 
   useEffect(() => {
-    const interval = setInterval(syncData, 5 * 60 * 1000); // Auto-sync every 5 mins
+    const interval = setInterval(syncData, 5 * 60 * 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [syncData]);
 
   return {
     restaurants,
@@ -387,7 +389,6 @@ const POPULAR_DISHES = [
 
 // === Main Component ===
 const MalawianRestaurantApp = () => {
-  // Use Google Sheets data with fallback
   const {
     restaurants: sheetRestaurants,
     menuItems: sheetMenuItems,
@@ -407,7 +408,6 @@ const MalawianRestaurantApp = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [showRestaurantPanel, setShowRestaurantPanel] = useState(false);
 
-  // Use Google Sheets data or fallback
   const restaurants = sheetRestaurants.length > 0 ? sheetRestaurants : FALLBACK_RESTAURANTS;
   const menuItems = Object.keys(sheetMenuItems).length > 0 ? sheetMenuItems : FALLBACK_MENU_ITEMS;
 
@@ -418,7 +418,6 @@ const MalawianRestaurantApp = () => {
       restaurant.location.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  // Components
   const MenuItem = ({ item, onClick }) => (
     <div
       className="bg-white rounded-lg shadow-md hover:shadow-lg transition-shadow cursor-pointer p-4 border"
@@ -510,7 +509,6 @@ const MalawianRestaurantApp = () => {
     </div>
   );
 
-  // Tabs
   const HomeTab = () => (
     <div className="flex-1 p-6 overflow-y-auto pb-20">
       <div className="max-w-6xl mx-auto">
@@ -603,7 +601,6 @@ const MalawianRestaurantApp = () => {
 
   const MenuTab = () => (
     <div className="flex-1 flex px-6 py-6 gap-6 overflow-hidden pb-20">
-      {/* Mobile Toggle Button */}
       <button
         className="md:hidden fixed top-4 left-4 z-30 bg-red-600 text-white p-2 rounded-lg shadow-lg"
         onClick={() => setShowRestaurantPanel(!showRestaurantPanel)}
@@ -611,7 +608,6 @@ const MalawianRestaurantApp = () => {
         <UtensilsCrossed className="w-5 h-5" />
       </button>
 
-      {/* Restaurant Panel */}
       <div
         className={`
           ${showRestaurantPanel ? 'translate-x-0' : '-translate-x-full'} 
@@ -668,7 +664,6 @@ const MalawianRestaurantApp = () => {
         </div>
       </div>
 
-      {/* Overlay */}
       {showRestaurantPanel && (
         <div
           className="md:hidden fixed inset-0 bg-black bg-opacity-50 z-10"
@@ -676,7 +671,6 @@ const MalawianRestaurantApp = () => {
         />
       )}
 
-      {/* Menu Display */}
       <div className="flex-1 bg-white rounded-lg shadow-md overflow-hidden flex flex-col">
         {selectedRestaurant ? (
           <>
@@ -715,7 +709,6 @@ const MalawianRestaurantApp = () => {
     </div>
   );
 
-  // Sync Status Indicator
   const SyncStatus = () => (
     <div className="fixed top-4 right-4 z-50">
       {syncLoading && (
@@ -748,7 +741,6 @@ const MalawianRestaurantApp = () => {
         {activeTab === 'home' ? <HomeTab /> : <MenuTab />}
       </div>
 
-      {/* Bottom Tab Navigation */}
       <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg">
         <div className="flex justify-center">
           <div className="flex space-x-8 px-6 py-3">
@@ -778,7 +770,6 @@ const MalawianRestaurantApp = () => {
         </div>
       </div>
 
-      {/* Modal */}
       {selectedMenuItem && (
         <MenuItemModal item={selectedMenuItem} onClose={() => setSelectedMenuItem(null)} />
       )}
@@ -786,4 +777,4 @@ const MalawianRestaurantApp = () => {
   );
 };
 
-export default MalawianRestaurantApp; 
+export default MalawianRestaurantApp;
