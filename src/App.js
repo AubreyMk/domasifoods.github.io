@@ -1,784 +1,490 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, memo } from 'react';
 import {
-  Search,
-  Home,
-  UtensilsCrossed,
-  Star,
-  MapPin,
-  Clock,
+  Search, Home, UtensilsCrossed, Star, MapPin,
+  Clock, Navigation, X, AlertCircle,
 } from 'lucide-react';
 
-// === Google Sheets Integration Classes ===
-  const BASE_IMAGE_URL = 'http://localhost:3000/img';
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────────────────────
+const FALLBACK_IMG =
+  'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=500&h=400&fit=crop';
 
-class GoogleSheetsService {
-  constructor(apiKey, sheetId) {
-    this.apiKey = apiKey;
-    this.sheetId = sheetId;
-    this.baseUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`;
+const DEBUG = process.env.NODE_ENV !== 'production';
+const log  = (...a) => DEBUG && console.log('[RestaurantApp]', ...a);
+const warn = (...a) => DEBUG && console.warn('[RestaurantApp]', ...a);
+const err  = (...a) => console.error('[RestaurantApp]', ...a);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GOOGLE DRIVE URL CONVERSION
+//
+// FIX: drive.google.com/uc?export=view redirects to a download/virus-scan
+// page — browsers refuse to render it in <img> tags.
+// The correct embeddable format is:
+//   https://lh3.googleusercontent.com/d/FILE_ID
+// which serves the raw bytes directly with proper CORS headers.
+// ─────────────────────────────────────────────────────────────────────────────
+export const getDriveImageUrl = (raw) => {
+  if (!raw) return FALLBACK_IMG;
+  const url = raw.toString().trim();
+
+  // Already a non-Drive URL → pass through
+  if (!url.includes('drive.google.com') && url.startsWith('http')) {
+    return url;
   }
 
-  async getSheetData(range = 'Sheet1!A:G') {
-    try {
-      const response = await fetch(
-        `${this.baseUrl}/values/${range}?key=${this.apiKey}`
-      );
-      const data = await response.json();
-      return data.values || [];
-    } catch (error) {
-      console.error('Error fetching sheet data:', error);
-      throw error;
+  let fileId = null;
+
+  // Format A: /file/d/{ID}/...
+  const filePathMatch = url.match(/\/file\/d\/([-\w]{10,})/);
+  if (filePathMatch) fileId = filePathMatch[1];
+
+  // Format B/C: ?id={ID} or &id={ID}
+  if (!fileId) {
+    const queryMatch = url.match(/[?&]id=([-\w]{10,})/);
+    if (queryMatch) fileId = queryMatch[1];
+  }
+
+  // Format D: bare file ID (28-44 chars, no spaces/dots/slashes)
+  if (!fileId && /^[-\w]{28,44}$/.test(url)) fileId = url;
+
+  if (fileId) {
+    // FIX: use lh3.googleusercontent.com — the only Drive URL that browsers
+    // can load directly in <img> without being redirected to a download page.
+    const resolved = `https://lh3.googleusercontent.com/d/${fileId}`;
+    log('Drive ID', fileId, '→', resolved);
+    return resolved;
+  }
+
+  warn('Could not extract Drive file ID from:', url);
+  return FALLBACK_IMG;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SafeImage
+// FIX: compute the URL once on mount/src-change via useMemo-style init,
+// not on every render. Also guard against infinite error loops.
+// ─────────────────────────────────────────────────────────────────────────────
+const SafeImage = memo(({ src, alt, className }) => {
+  // Resolve once; don't re-run getGoogleDriveImageUrl on every parent render
+  const [imgSrc, setImgSrc] = useState(() => getDriveImageUrl(src));
+  const [failed, setFailed]  = useState(false);
+
+  useEffect(() => {
+    setImgSrc(getDriveImageUrl(src));
+    setFailed(false);
+  }, [src]);
+
+  const handleError = useCallback(() => {
+    if (!failed) {
+      warn('Image failed to load:', imgSrc);
+      setFailed(true);
+      setImgSrc(FALLBACK_IMG);
     }
+    // No more setImgSrc after fallback — prevents infinite onError loop
+  }, [failed, imgSrc]);
+
+  return (
+    <img
+      src={imgSrc || FALLBACK_IMG}
+      alt={alt}
+      className={className}
+      onError={handleError}
+    />
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Google Sheets Service
+// ─────────────────────────────────────────────────────────────────────────────
+class GoogleSheetsService {
+  constructor(apiKey, sheetId) {
+    if (!apiKey) warn('Missing REACT_APP_GOOGLE_SHEETS_API_KEY');
+    if (!sheetId) warn('Missing REACT_APP_GOOGLE_SHEETS_ID');
+    this.apiKey   = apiKey;
+    this.sheetId  = sheetId;
+    this.baseUrl  = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`;
+  }
+
+  async _fetch(range) {
+    const url = `${this.baseUrl}/values/${encodeURIComponent(range)}?key=${this.apiKey}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const body = await res.text();
+      err(`Sheet fetch failed [${range}]:`, res.status, body);
+      return [];
+    }
+    const data = await res.json();
+    return data.values || [];
+  }
+
+  async getSheetData(range = 'Sheet1!A:M') {
+    try {
+      const rows = await this._fetch(range);
+      log('Sheet rows received:', rows.length);
+      return rows;
+    } catch (e) { err('getSheetData:', e); return []; }
+  }
+
+  async getGourmetPicks(range = 'GourmetPicks!A:F') {
+    try {
+      const rows = await this._fetch(range);
+      if (rows.length < 2) { warn('GourmetPicks: empty'); return []; }
+      const [, ...data] = rows;
+      return data.slice(0, 3).map((row, i) => ({
+        id:          `promo-${i}`,
+        name:        row[0] || '',
+        description: row[1] || '',
+        promoText:   row[2] || '',
+        image:       getDriveImageUrl(row[3]?.trim()),
+        price:       row[4] || '',
+        mapsUrl:     row[5] || '',
+      }));
+    } catch (e) { err('getGourmetPicks:', e); return []; }
   }
 
   parseSheetData(sheetData) {
-    if (!sheetData || sheetData.length < 2) return { restaurants: [], menuItems: {} };
-
-    const [headers, ...rows] = sheetData;
+    if (!sheetData || sheetData.length < 2) {
+      warn('parseSheetData: no data'); return { restaurants: [], menuItems: {} };
+    }
+    const [, ...rows] = sheetData;
     const restaurants = new Map();
-    const menuItems = {};
+    const menuItems   = {};
+    let   skipped     = 0;
 
-    rows.forEach((row) => {
-      if (row.length < 7) return;
+    rows.forEach((row, idx) => {
+      if (row.length < 7) { skipped++; return; }
+      const [rName, itemName, price, cat, desc, img, , loc, spec, rate, rImg, maps, isTop] = row;
+      if (!rName) { skipped++; return; }
 
-      const [
-        restaurantName,
-        itemName,
-        price,
-        category,
-        description,
-        imageUrl,
-        available,
-        restaurantLocation,
-        restaurantSpecialty,
-        restaurantRating,
-        restaurantImage,
-      ] = row;
-
-      // Create restaurant entry
-      if (!restaurants.has(restaurantName)) {
-        const restaurantId = this.generateId(restaurantName);
-        restaurants.set(restaurantName, {
-          id: restaurantId,
-          name: restaurantName,
-          location: restaurantLocation || 'Malawi',
-          specialty: restaurantSpecialty || 'Malawian Cuisine',
-          rating: parseFloat(restaurantRating) || 4.5,
-          image:
-            restaurantImage ||
-            'https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=300&h=200&fit=crop',
+      if (!restaurants.has(rName)) {
+        const rId = rName.toLowerCase().replace(/[^a-z0-9]/g, '');
+        restaurants.set(rName, {
+          id:       rId,
+          name:     rName,
+          location: loc  || 'Malawi',
+          specialty:spec  || 'Malawian Cuisine',
+          rating:   parseFloat(rate) || 4.5,
+          image:    getDriveImageUrl(rImg?.trim()),
+          mapsUrl:  maps || '',
+          isTop:    isTop === 'TRUE',
         });
-        menuItems[restaurantId] = [];
+        menuItems[rId] = [];
       }
 
-      // Add menu item
-      const restaurantId = restaurants.get(restaurantName).id;
-
-            // Add this as a class property or constant
-
-      // Inside parseSheetData, when adding a menu item:
-      menuItems[restaurantId].push({
-        id: this.generateId(itemName + restaurantName),
-        name: itemName,
-        price: price,
-        category: category || 'Main Dishes',
-        description: description || '',
-        image: imageUrl 
-        ? `${BASE_IMAGE_URL}/${imageUrl.trim()}` // ← Use BASE_IMAGE_URL directly
-        : `${BASE_IMAGE_URL}/placeholder.jpg`,       
-         available: available !== 'FALSE'
+      const rId = restaurants.get(rName).id;
+      menuItems[rId].push({
+        id:          `${itemName}-${rId}-${idx}`,
+        name:        itemName || 'Unnamed Item',
+        price:       price    || '',
+        category:    cat      || 'Main Dishes',
+        description: desc     || '',
+        image:       getDriveImageUrl(img?.trim()),
+        mapsUrl:     maps     || '',
       });
     });
 
-    return {
-      restaurants: Array.from(restaurants.values()),
-      menuItems,
-    };
-  }
-
-  generateId(text) {
-    return (
-      text.toLowerCase().replace(/[^a-z0-9]/g, '') + Date.now().toString().slice(-4)
-    );
+    if (skipped) warn(`Skipped ${skipped} rows`);
+    log(`Parsed: ${restaurants.size} restaurants`);
+    return { restaurants: Array.from(restaurants.values()), menuItems };
   }
 }
 
-class MenuSyncService {
-  constructor(apiBaseUrl, googleSheetsService) {
-    this.apiBaseUrl = apiBaseUrl;
-    this.sheetsService = googleSheetsService;
-  }
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-components
+// FIX: defined OUTSIDE the parent component so React doesn't recreate them
+// on every render — the root cause of the repeated getGoogleDriveImageUrl
+// calls and flashing images when opening the menu modal.
+// ─────────────────────────────────────────────────────────────────────────────
+const ErrorBanner = ({ message }) => (
+  <div className="flex items-center gap-2 bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-2 rounded-lg mb-4">
+    <AlertCircle className="w-4 h-4 flex-shrink-0" /><span>{message}</span>
+  </div>
+);
 
-  async syncFromGoogleSheets() {
-    try {
-      console.log('🔄 Starting sync from Google Sheets...');
-      const sheetData = await this.sheetsService.getSheetData();
-      const parsedData = this.sheetsService.parseSheetData(sheetData);
-
-      console.log(`📊 Found ${parsedData.restaurants.length} restaurants with menus`);
-
-      for (const restaurant of parsedData.restaurants) {
-        await this.syncRestaurant(restaurant, parsedData.menuItems[restaurant.id]);
-      }
-
-      console.log('✅ Sync completed successfully!');
-      return parsedData;
-    } catch (error) {
-      console.error('❌ Sync failed:', error);
-      throw error;
-    }
-  }
-
-  async syncRestaurant(restaurantData, menuItems) {
-    try {
-      const existingRestaurant = await this.findRestaurantByName(restaurantData.name);
-      let restaurantId;
-
-      if (existingRestaurant) {
-        restaurantId = existingRestaurant.id;
-        await this.updateRestaurant(restaurantId, restaurantData);
-        console.log(`📝 Updated restaurant: ${restaurantData.name}`);
-      } else {
-        const newRestaurant = await this.createRestaurant(restaurantData);
-        restaurantId = newRestaurant.id;
-        console.log(`🆕 Created restaurant: ${restaurantData.name}`);
-      }
-
-      if (menuItems && menuItems.length > 0) {
-        await this.syncMenuItems(restaurantId, menuItems);
-      }
-    } catch (error) {
-      console.error(`Error syncing restaurant ${restaurantData.name}:`, error);
-    }
-  }
-
-  async findRestaurantByName(name) {
-    try {
-      const response = await fetch(
-        `${this.apiBaseUrl}/search/restaurants?q=${encodeURIComponent(name)}`
-      );
-      const data = await response.json();
-      return data.data?.find((r) => r.name.toLowerCase() === name.toLowerCase());
-    } catch (error) {
-      return null;
-    }
-  }
-
-  async createRestaurant(restaurantData) {
-    const response = await fetch(`${this.apiBaseUrl}/restaurants`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(restaurantData),
-    });
-    const result = await response.json();
-    if (!result.success) throw new Error(result.message);
-    return result.data;
-  }
-
-  async updateRestaurant(id, restaurantData) {
-    const response = await fetch(`${this.apiBaseUrl}/restaurants/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(restaurantData),
-    });
-    const result = await response.json();
-    if (!result.success) throw new Error(result.message);
-    return result.data;
-  }
-
-  async syncMenuItems(restaurantId, menuItems) {
-    try {
-      const menusResponse = await fetch(
-        `${this.apiBaseUrl}/restaurants/${restaurantId}/menus`
-      );
-      const menusData = await menusResponse.json();
-
-      let menuId;
-      if (menusData.data?.length > 0) {
-        menuId = menusData.data[0].id;
-      } else {
-        const menuResponse = await fetch(
-          `${this.apiBaseUrl}/restaurants/${restaurantId}/menus`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: 'Main Menu',
-              description: 'Restaurant menu from Google Sheets',
-              is_active: true,
-            }),
-          }
-        );
-        const menuResult = await menuResponse.json();
-        menuId = menuResult.data.id;
-      }
-
-      const response = await fetch(`${this.apiBaseUrl}/menus/${menuId}/items/bulk`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: menuItems }),
-      });
-
-      const result = await response.json();
-      if (!result.success) throw new Error(result.message);
-
-      console.log(`📋 Synced ${menuItems.length} menu items`);
-      return result.data;
-    } catch (error) {
-      console.error('Error syncing menu items:', error);
-      throw error;
-    }
-  }
-}
-
-// === Custom Hook: useGoogleSheetsMenu ===
-export const useGoogleSheetsMenu = (apiKey, sheetId, apiBaseUrl) => {
-  const [restaurants, setRestaurants] = useState([]);
-  const [menuItems, setMenuItems] = useState({});
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const [lastSync, setLastSync] = useState(null);
-
-  const sheetsService = new GoogleSheetsService(apiKey, sheetId);
-  const syncService = new MenuSyncService(apiBaseUrl, sheetsService);
-
-  const syncData = async () => {
-    try {
-      setLoading(true);
-      setError(null);
-
-      const data = await syncService.syncFromGoogleSheets();
-      setRestaurants(data.restaurants);
-      setMenuItems(data.menuItems);
-      setLastSync(new Date());
-    } catch (err) {
-      setError(err.message);
-      console.error('Sync error:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    syncData();
-  }, []);
-
-  useEffect(() => {
-    const interval = setInterval(syncData, 5 * 60 * 1000); // Auto-sync every 5 mins
-    return () => clearInterval(interval);
-  }, []);
-
-  return {
-    restaurants,
-    menuItems,
-    loading,
-    error,
-    lastSync,
-    manualSync: syncData,
-  };
-};
-
-// === Fallback Data (for when Google Sheets is unavailable) ===
-const FALLBACK_RESTAURANTS = [
-  {
-    id: 1,
-    name: "Mama's Kitchen",
-    location: 'Blantyre City Centre',
-    specialty: 'Traditional Malawian',
-    rating: 4.8,
-    image:
-      'https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=300&h=200&fit=crop',
-  },
-  {
-    id: 2,
-    name: 'Nyama House',
-    location: 'Area 47, Lilongwe',
-    specialty: 'Grilled Meats',
-    rating: 4.6,
-    image:
-      'https://images.unsplash.com/photo-1558030006-450675393462?w=300&h=200&fit=crop',
-  },
-  {
-    id: 3,
-    name: 'Lake View Restaurant',
-    location: 'Mangochi',
-    specialty: 'Fish & Traditional',
-    rating: 4.5,
-    image:
-      'https://images.unsplash.com/photo-1544148103-0773bf10d330?w=300&h=200&fit=crop',
-  },
-  {
-    id: 4,
-    name: 'Spice Garden',
-    location: 'Mzuzu',
-    specialty: 'Fusion Cuisine',
-    rating: 4.7,
-    image:
-      'https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?w=300&h=200&fit=crop',
-  },
-  {
-    id: 5,
-    name: 'Village Taste',
-    location: 'Zomba',
-    specialty: 'Home Style Cooking',
-    rating: 4.9,
-    image:
-      'https://images.unsplash.com/photo-1590846406792-0adc7f938f1d?w=300&h=200&fit=crop',
-  },
-];
-
-const FALLBACK_MENU_ITEMS = {
-  1: [
-    {
-      id: 1,
-      name: 'Nsima with Ndiwo',
-      price: 'MK 1,500',
-      category: 'Main Dishes',
-      image:
-        'https://images.unsplash.com/photo-1586511925558-a4c6376fe65f?w=400&h=300&fit=crop',
-      description: 'Traditional nsima with choice of relish (ndiwo)',
-    },
-    {
-      id: 2,
-      name: 'Chambo with Rice',
-      price: 'MK 2,800',
-      category: 'Fish Dishes',
-      image:
-        'https://images.unsplash.com/photo-1544943910-4c1dc44aab44?w=400&h=300&fit=crop',
-      description: 'Fresh chambo fish grilled with spices',
-    },
-  ],
-  2: [
-    {
-      id: 4,
-      name: 'Nyama ya Ng\'ombe',
-      price: 'MK 3,200',
-      category: 'Grilled Meats',
-      image:
-        'https://images.unsplash.com/photo-1544025162-d76694265947?w=400&h=300&fit=crop',
-      description: 'Grilled beef with nsima and vegetables',
-    },
-  ],
-};
-
-const POPULAR_DISHES = [
-  {
-    id: 1,
-    title: 'Traditional Nsima Experience',
-    description: 'Discover authentic Malawian cuisine with our traditional nsima dishes',
-    image:
-      'https://images.unsplash.com/photo-1586511925558-a4c6376fe65f?w=400&h=200&fit=crop',
-  },
-  {
-    id: 2,
-    title: 'Fresh Lake Fish',
-    description: 'Enjoy the finest chambo and other fish from Lake Malawi',
-    image:
-      'https://images.unsplash.com/photo-1544943910-4c1dc44aab44?w=400&h=200&fit=crop',
-  },
-  {
-    id: 3,
-    title: 'Local Specialties',
-    description: 'Taste unique Malawian flavors and traditional cooking methods',
-    image:
-      'https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=400&h=200&fit=crop',
-  },
-];
-
-// === Main Component ===
-const MalawianRestaurantApp = () => {
-  // Use Google Sheets data with fallback
-  const {
-    restaurants: sheetRestaurants,
-    menuItems: sheetMenuItems,
-    loading: syncLoading,
-    error: syncError,
-    lastSync,
-    manualSync,
-  } = useGoogleSheetsMenu(
-    process.env.REACT_APP_GOOGLE_SHEETS_API_KEY,
-    process.env.REACT_APP_GOOGLE_SHEETS_ID,
-    process.env.REACT_APP_API_BASE_URL || 'http://localhost:3000/api'
-  );
-
-  const [activeTab, setActiveTab] = useState('home');
-  const [selectedRestaurant, setSelectedRestaurant] = useState(null);
-  const [selectedMenuItem, setSelectedMenuItem] = useState(null);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [showRestaurantPanel, setShowRestaurantPanel] = useState(false);
-
-  // Use Google Sheets data or fallback
-  const restaurants = sheetRestaurants.length > 0 ? sheetRestaurants : FALLBACK_RESTAURANTS;
-  const menuItems = Object.keys(sheetMenuItems).length > 0 ? sheetMenuItems : FALLBACK_MENU_ITEMS;
-
-  const filteredRestaurants = restaurants.filter(
-    (restaurant) =>
-      restaurant.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      restaurant.specialty.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      restaurant.location.toLowerCase().includes(searchTerm.toLowerCase())
-  );
-
-  // Components
-  const MenuItem = ({ item, onClick }) => (
-    <div
-      className="bg-white rounded-lg shadow-md hover:shadow-lg transition-shadow cursor-pointer p-4 border"
-      onClick={() => onClick(item)}
-    >
-      <img
-        src={item.image}
-        alt={item.name}
-        className="w-full h-32 object-cover rounded-lg mb-3"
-      />
-      <div className="flex justify-between items-start">
-        <div>
-          <h3 className="font-semibold text-gray-800">{item.name}</h3>
-          <p className="text-sm text-gray-600">{item.category}</p>
+const RestaurantCard = memo(({ restaurant, selected, onSelect }) => (
+  <div
+    className={`bg-white rounded-lg shadow-md hover:shadow-lg transition-shadow cursor-pointer border ${
+      selected ? 'ring-2 ring-red-500' : ''
+    }`}
+    onClick={onSelect}
+  >
+    <SafeImage src={restaurant.image} alt={restaurant.name} className="w-full h-24 object-cover rounded-t-lg" />
+    <div className="p-3">
+      <h3 className="font-semibold text-sm truncate">{restaurant.name}</h3>
+      <p className="text-xs text-gray-600">{restaurant.specialty}</p>
+      <div className="flex items-center justify-between mt-2 text-xs">
+        <div className="flex items-center">
+          <Star className="w-3 h-3 text-yellow-400 mr-1" /><span>{restaurant.rating}</span>
         </div>
-        <span className="font-bold text-green-600">{item.price}</span>
+        <div className="flex items-center text-gray-500">
+          <MapPin className="w-3 h-3 mr-1" /><span className="truncate">{restaurant.location}</span>
+        </div>
       </div>
     </div>
-  );
+  </div>
+));
 
-  const MenuItemModal = ({ item, onClose }) => (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-lg max-w-md w-full">
+const MenuItem = memo(({ item, onSelect }) => (
+  <div
+    className="bg-white rounded-lg shadow-md hover:shadow-lg transition-shadow cursor-pointer p-4 border"
+    onClick={onSelect}
+  >
+    <SafeImage src={item.image} alt={item.name} className="w-full h-32 object-cover rounded-lg mb-3" />
+    <div className="flex justify-between items-start">
+      <div>
+        <h3 className="font-semibold text-gray-800">{item.name}</h3>
+        <p className="text-sm text-gray-600">{item.category}</p>
+      </div>
+      <span className="font-bold text-green-600">{item.price}</span>
+    </div>
+  </div>
+));
+
+const MenuItemModal = memo(({ item, onClose }) => {
+  const mapsUrl = item.mapsUrl?.startsWith('http')
+    ? item.mapsUrl
+    : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(item.name)}`;
+
+  return (
+    <div
+      className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
+      onClick={onClose}
+    >
+      <div className="bg-white rounded-lg max-w-md w-full" onClick={e => e.stopPropagation()}>
         <div className="relative">
-          <img
-            src={item.image}
-            alt={item.name}
-            className="w-full h-48 object-cover rounded-t-lg"
-          />
-          <button
-            onClick={onClose}
-            className="absolute top-2 right-2 bg-white rounded-full p-1 hover:bg-gray-100"
-          >
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M6 18L18 6M6 6l12 12"
-              />
-            </svg>
+          {/* FIX: image src is already resolved — no extra getDriveImageUrl call here */}
+          <SafeImage src={item.image} alt={item.name} className="w-full h-48 object-cover rounded-t-lg" />
+          <button onClick={onClose} className="absolute top-2 right-2 bg-white rounded-full p-1 shadow-md hover:bg-gray-100">
+            <X className="w-6 h-6" />
           </button>
         </div>
         <div className="p-6">
           <h2 className="text-xl font-bold mb-2">{item.name}</h2>
-          <p className="text-gray-600 mb-4">{item.description}</p>
-          <div className="flex justify-between items-center">
-            <span className="text-2xl font-bold text-green-600">{item.price}</span>
-            <button className="bg-red-600 text-white px-6 py-2 rounded-lg hover:bg-red-700">
-              Order Now
-            </button>
+          <p className="text-gray-600 mb-6">{item.description}</p>
+          <div className="flex flex-col gap-3">
+            <a
+              href={mapsUrl} target="_blank" rel="noopener noreferrer"
+              className="flex items-center justify-center bg-blue-600 text-white py-3 rounded-lg font-bold hover:bg-blue-700"
+            >
+              <Navigation className="w-4 h-4 mr-2" /> Directions
+            </a>
+            <div className="flex justify-between items-center mt-2">
+              <span className="text-2xl font-bold text-green-600">{item.price}</span>
+              <button className="bg-red-600 text-white px-8 py-2 rounded-lg font-bold">Order Now</button>
+            </div>
           </div>
         </div>
       </div>
     </div>
   );
+});
 
-  const RestaurantCard = ({ restaurant, onClick }) => (
-    <div
-      className={`bg-white rounded-lg shadow-md hover:shadow-lg transition-shadow cursor-pointer border ${
-        selectedRestaurant?.id === restaurant.id ? 'ring-2 ring-red-500' : ''
-      }`}
-      onClick={() => {
-        onClick(restaurant);
-        if (window.innerWidth < 768) {
-          setShowRestaurantPanel(false);
-        }
-      }}
-    >
-      <img
-        src={restaurant.image}
-        alt={restaurant.name}
-        className="w-full h-24 object-cover rounded-t-lg"
-      />
-      <div className="p-3">
-        <h3 className="font-semibold text-sm truncate">{restaurant.name}</h3>
-        <p className="text-xs text-gray-600">{restaurant.specialty}</p>
-        <div className="flex items-center justify-between mt-2 text-xs">
-          <div className="flex items-center">
-            <Star className="w-3 h-3 text-yellow-400 mr-1" />
-            <span>{restaurant.rating}</span>
-          </div>
-          <div className="flex items-center text-gray-500">
-            <MapPin className="w-3 h-3 mr-1" />
-            <span className="truncate">{restaurant.location}</span>
-          </div>
-        </div>
-      </div>
-    </div>
+// ─────────────────────────────────────────────────────────────────────────────
+// Main Component
+// ─────────────────────────────────────────────────────────────────────────────
+const MalawianRestaurantApp = () => {
+  const [restaurants,        setRestaurants]        = useState([]);
+  const [menuItems,          setMenuItems]           = useState({});
+  const [gourmetPicks,       setGourmetPicks]        = useState([]);
+  const [activeTab,          setActiveTab]           = useState('home');
+  const [selectedRestaurant, setSelectedRestaurant]  = useState(null);
+  const [selectedMenuItem,   setSelectedMenuItem]    = useState(null);
+  const [searchTerm,         setSearchTerm]          = useState('');
+  const [showSidebar,        setShowSidebar]         = useState(false);
+  const [loadError,          setLoadError]           = useState(null);
+  const [loading,            setLoading]             = useState(true);
+
+  useEffect(() => {
+    const apiKey  = process.env.REACT_APP_GOOGLE_SHEETS_API_KEY;
+    const sheetId = process.env.REACT_APP_GOOGLE_SHEETS_ID;
+    if (!apiKey || !sheetId) {
+      setLoadError('Missing REACT_APP_GOOGLE_SHEETS_API_KEY or REACT_APP_GOOGLE_SHEETS_ID');
+      setLoading(false); return;
+    }
+    const sheets = new GoogleSheetsService(apiKey, sheetId);
+    (async () => {
+      try {
+        const [sheetData, picks] = await Promise.all([sheets.getSheetData(), sheets.getGourmetPicks()]);
+        const parsed = sheets.parseSheetData(sheetData);
+        setRestaurants(parsed.restaurants);
+        setMenuItems(parsed.menuItems);
+        setGourmetPicks(picks);
+      } catch (e) {
+        err('Sync failed:', e);
+        setLoadError('Failed to load data. Check console for details.');
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  const filteredRestaurants = restaurants.filter(r =>
+    r.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    r.location.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  // Tabs
+  const selectRestaurantForMenu = useCallback((r) => {
+    setSelectedRestaurant(r);
+    setActiveTab('menu');
+    setShowSidebar(false);
+  }, []);
+
+  // ── Home Tab ────────────────────────────────────────────────────────────────
   const HomeTab = () => (
     <div className="flex-1 p-6 overflow-y-auto pb-20">
       <div className="max-w-6xl mx-auto">
+        {loadError && <ErrorBanner message={loadError} />}
+
         <div className="text-center mb-8">
           <h1 className="text-3xl font-bold text-gray-800 mb-2">Malawian Restaurant Menus</h1>
-          <p className="text-gray-600">
-            Discover authentic Malawian cuisine from restaurants across the warm heart of Africa
-          </p>
+          <p className="text-gray-600">Discover authentic Malawian cuisine from the warm heart of Africa</p>
         </div>
 
-        <section className="mb-8">
-          <h2 className="text-2xl font-semibold mb-4 flex items-center">
-            <UtensilsCrossed className="w-6 h-6 mr-2 text-red-600" />
-            Featured Dishes
-          </h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {POPULAR_DISHES.map((dish) => (
-              <div
-                key={dish.id}
-                className="bg-gradient-to-br from-red-500 to-orange-500 rounded-lg overflow-hidden shadow-lg text-white"
-              >
-                <img
-                  src={dish.image}
-                  alt={dish.title}
-                  className="w-full h-32 object-cover opacity-80"
-                />
-                <div className="p-4">
-                  <h3 className="font-bold text-lg mb-2">{dish.title}</h3>
-                  <p className="text-sm opacity-90">{dish.description}</p>
+        {loading ? (
+          <div className="flex justify-center py-20 text-gray-400">Loading…</div>
+        ) : (
+          <>
+            {gourmetPicks.length > 0 && (
+              <section className="mb-8">
+                <h2 className="text-2xl font-semibold mb-4 flex items-center">
+                  <UtensilsCrossed className="w-6 h-6 mr-2 text-red-600" /> Gourmet's Picks
+                </h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {gourmetPicks.map(dish => (
+                    <div
+                      key={dish.id}
+                      className="bg-gradient-to-br from-red-500 to-orange-500 rounded-lg overflow-hidden shadow-lg text-white cursor-pointer"
+                      onClick={() => setSelectedMenuItem(dish)}
+                    >
+                      <SafeImage src={dish.image} alt={dish.name} className="w-full h-32 object-cover opacity-80" />
+                      <div className="p-4">
+                        <h3 className="font-bold text-lg mb-2">
+                          {dish.name}{' '}
+                          <span className="text-xs bg-white/20 px-2 py-1 rounded ml-2">{dish.promoText}</span>
+                        </h3>
+                        <p className="text-sm opacity-90">{dish.description}</p>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              </div>
-            ))}
-          </div>
-        </section>
+              </section>
+            )}
 
-        <section className="mb-8">
-          <h2 className="text-2xl font-semibold mb-4 flex items-center">
-            <MapPin className="w-6 h-6 mr-2 text-red-600" />
-            Popular Restaurants
-          </h2>
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-            {restaurants.slice(0, 5).map((restaurant) => (
-              <RestaurantCard
-                key={restaurant.id}
-                restaurant={restaurant}
-                onClick={(r) => {
-                  setSelectedRestaurant(r);
-                  setActiveTab('menu');
-                }}
-              />
-            ))}
-          </div>
-        </section>
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold mb-4 flex items-center text-gray-800">
+                <MapPin className="w-6 h-6 mr-2 text-red-600" /> Popular Restaurants
+              </h2>
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+                {restaurants.filter(r => r.isTop).slice(0, 5).map(r => (
+                  <RestaurantCard
+                    key={r.id} restaurant={r}
+                    selected={selectedRestaurant?.id === r.id}
+                    onSelect={() => selectRestaurantForMenu(r)}
+                  />
+                ))}
+              </div>
+              {!loading && restaurants.filter(r => r.isTop).length === 0 && (
+                <p className="text-gray-400 text-sm mt-2">
+                  No featured restaurants yet — add <code>TRUE</code> in column M.
+                </p>
+              )}
+            </section>
 
-        <section>
-          <h2 className="text-2xl font-semibold mb-4">🇲🇼 About Malawian Cuisine</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="bg-white p-6 rounded-lg shadow-md text-center">
-              <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                <UtensilsCrossed className="w-6 h-6 text-red-600" />
-              </div>
-              <h3 className="font-semibold mb-2">Nsima - Staple Food</h3>
-              <p className="text-gray-600 text-sm">
-                Made from maize flour, nsima is the cornerstone of Malawian meals
-              </p>
-            </div>
-            <div className="bg-white p-6 rounded-lg shadow-md text-center">
-              <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                <Search className="w-6 h-6 text-blue-600" />
-              </div>
-              <h3 className="font-semibold mb-2">Lake Malawi Fish</h3>
-              <p className="text-gray-600 text-sm">
-                Fresh chambo, usipa, and other fish from Africa's third largest lake
-              </p>
-            </div>
-            <div className="bg-white p-6 rounded-lg shadow-md text-center">
-              <div className="w-12 h-12 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                <Clock className="w-6 h-6 text-green-600" />
-              </div>
-              <h3 className="font-semibold mb-2">Traditional Cooking</h3>
-              <p className="text-gray-600 text-sm">
-                Time-honored recipes passed down through generations
-              </p>
-            </div>
-          </div>
-        </section>
+            
+          </>
+        )}
       </div>
     </div>
   );
 
+  // ── Menu Tab ────────────────────────────────────────────────────────────────
   const MenuTab = () => (
     <div className="flex-1 flex px-6 py-6 gap-6 overflow-hidden pb-20">
-      {/* Mobile Toggle Button */}
       <button
         className="md:hidden fixed top-4 left-4 z-30 bg-red-600 text-white p-2 rounded-lg shadow-lg"
-        onClick={() => setShowRestaurantPanel(!showRestaurantPanel)}
+        onClick={() => setShowSidebar(s => !s)}
       >
         <UtensilsCrossed className="w-5 h-5" />
       </button>
 
-      {/* Restaurant Panel */}
-      <div
-        className={`
-          ${showRestaurantPanel ? 'translate-x-0' : '-translate-x-full'} 
-          md:translate-x-0 
-          fixed md:relative 
-          top-0 left-0 
-          w-80 md:w-1/4 
-          h-full md:h-auto 
-          bg-white 
-          rounded-none md:rounded-lg 
-          shadow-lg md:shadow-md 
-          p-4 
-          z-20 
-          transition-transform duration-300 ease-in-out
-          flex flex-col
-        `}
+      {/* Sidebar */}
+      <div className={`${showSidebar ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0
+        fixed md:relative top-0 left-0 w-80 md:w-1/4 h-full bg-white rounded-lg shadow-md p-4 z-20 flex flex-col`}
       >
-        <button
-          className="md:hidden self-end mb-2 p-1 hover:bg-gray-100 rounded"
-          onClick={() => setShowRestaurantPanel(false)}
-        >
-          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M6 18L18 6M6 6l12 12"
-            />
-          </svg>
-        </button>
-
         <div className="mb-4">
           <h2 className="text-lg font-semibold mb-3">Restaurants</h2>
           <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4" />
             <input
-              type="text"
-              placeholder="Search restaurants..."
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent text-sm"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
+              type="text" placeholder="Search…"
+              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm"
+              onChange={e => setSearchTerm(e.target.value)}
             />
           </div>
         </div>
-
-        <div className="flex-1 overflow-y-auto space-y-3 max-h-[calc(100vh-200px)] md:max-h-none">
-          {filteredRestaurants.map((restaurant) => (
-            <RestaurantCard
-              key={restaurant.id}
-              restaurant={restaurant}
-              onClick={setSelectedRestaurant}
-            />
-          ))}
+        <div className="flex-1 overflow-y-auto space-y-3">
+          {filteredRestaurants.length === 0
+            ? <p className="text-gray-400 text-sm text-center mt-8">No restaurants found</p>
+            : filteredRestaurants.map(r => (
+                <RestaurantCard
+                  key={r.id} restaurant={r}
+                  selected={selectedRestaurant?.id === r.id}
+                  onSelect={() => { setSelectedRestaurant(r); setShowSidebar(false); }}
+                />
+              ))
+          }
         </div>
       </div>
 
-      {/* Overlay */}
-      {showRestaurantPanel && (
-        <div
-          className="md:hidden fixed inset-0 bg-black bg-opacity-50 z-10"
-          onClick={() => setShowRestaurantPanel(false)}
-        />
-      )}
-
-      {/* Menu Display */}
+      {/* Menu panel */}
       <div className="flex-1 bg-white rounded-lg shadow-md overflow-hidden flex flex-col">
         {selectedRestaurant ? (
           <>
-            <div className="p-6 border-b bg-white">
+            <div className="p-6 border-b">
               <h1 className="text-2xl font-bold text-gray-800">{selectedRestaurant.name}</h1>
-              <p className="text-gray-600">
-                {selectedRestaurant.specialty} • {selectedRestaurant.location}
-              </p>
+              <p className="text-gray-600">{selectedRestaurant.specialty} • {selectedRestaurant.location}</p>
               <div className="flex items-center mt-2">
                 <Star className="w-4 h-4 text-yellow-400 mr-1" />
                 <span className="font-medium">{selectedRestaurant.rating}</span>
                 <span className="text-gray-500 ml-2">• Malawian Cuisine</span>
               </div>
             </div>
-
             <div className="flex-1 p-6 overflow-y-auto">
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {(menuItems[selectedRestaurant.id] || []).map((item) => (
-                  <MenuItem key={item.id} item={item} onClick={setSelectedMenuItem} />
-                ))}
-              </div>
+              {(menuItems[selectedRestaurant.id] || []).length === 0
+                ? <p className="text-gray-400 text-sm text-center mt-8">No menu items yet</p>
+                : <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {(menuItems[selectedRestaurant.id] || []).map(item => (
+                      <MenuItem key={item.id} item={item} onSelect={() => setSelectedMenuItem(item)} />
+                    ))}
+                  </div>
+              }
             </div>
           </>
         ) : (
-          <div className="flex flex-col items-center justify-center h-full text-gray-500">
+          <div className="flex flex-col items-center justify-center h-full text-gray-400">
             <UtensilsCrossed className="w-16 h-16 mb-4" />
-            <h2 className="text-xl font-semibold mb-2">Select a Restaurant</h2>
-            <p className="text-center">
-              {window.innerWidth < 768
-                ? 'Tap the menu icon to choose a restaurant'
-                : 'Choose a restaurant from the left panel to view their menu'}
-            </p>
+            <p>Select a restaurant to view their menu</p>
           </div>
         )}
       </div>
     </div>
   );
 
-  // Sync Status Indicator
-  const SyncStatus = () => (
-    <div className="fixed top-4 right-4 z-50">
-      {syncLoading && (
-        <div className="bg-blue-500 text-white px-3 py-2 rounded-lg shadow-lg flex items-center">
-          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
-          Syncing menus...
-        </div>
-      )}
-      {syncError && (
-        <div className="bg-red-500 text-white px-3 py-2 rounded-lg shadow-lg">
-          Sync failed: {syncError}
-        </div>
-      )}
-      {lastSync && !syncLoading && !syncError && (
-        <div className="bg-green-500 text-white px-3 py-2 rounded-lg shadow-lg text-sm">
-          Last sync: {lastSync.toLocaleTimeString()}
-          <button onClick={manualSync} className="ml-2 underline hover:no-underline">
-            Refresh
-          </button>
-        </div>
-      )}
-    </div>
-  );
-
+  // ── Root ────────────────────────────────────────────────────────────────────
   return (
-    <div className="min-h-screen bg-gray-50">
-      <SyncStatus />
-      
-      <div className="flex flex-col min-h-screen">
-        {activeTab === 'home' ? <HomeTab /> : <MenuTab />}
-      </div>
+    <div className="min-h-screen bg-gray-50 flex flex-col">
+      {activeTab === 'home' ? <HomeTab /> : <MenuTab />}
 
-      {/* Bottom Tab Navigation */}
-      <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg">
-        <div className="flex justify-center">
-          <div className="flex space-x-8 px-6 py-3">
-            <button
-              className={`flex flex-col items-center space-y-1 px-4 py-2 rounded-lg transition-colors ${
-                activeTab === 'home'
-                  ? 'text-red-600 bg-red-50'
-                  : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
-              }`}
-              onClick={() => setActiveTab('home')}
-            >
-              <Home className="w-6 h-6" />
-              <span className="text-xs font-medium">Home</span>
-            </button>
-            <button
-              className={`flex flex-col items-center space-y-1 px-4 py-2 rounded-lg transition-colors ${
-                activeTab === 'menu'
-                  ? 'text-red-600 bg-red-50'
-                  : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
-              }`}
-              onClick={() => setActiveTab('menu')}
-            >
-              <UtensilsCrossed className="w-6 h-6" />
-              <span className="text-xs font-medium">Menus</span>
-            </button>
-          </div>
-        </div>
-      </div>
+      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t p-3 flex justify-center gap-12 shadow-lg z-40 text-gray-500">
+        <button onClick={() => setActiveTab('home')} className={`flex flex-col items-center ${activeTab === 'home' ? 'text-red-600' : ''}`}>
+          <Home className="w-6 h-6" /><span className="text-xs">Home</span>
+        </button>
+        <button onClick={() => setActiveTab('menu')} className={`flex flex-col items-center ${activeTab === 'menu' ? 'text-red-600' : ''}`}>
+          <UtensilsCrossed className="w-6 h-6" /><span className="text-xs">Menus</span>
+        </button>
+      </nav>
 
-      {/* Modal */}
       {selectedMenuItem && (
         <MenuItemModal item={selectedMenuItem} onClose={() => setSelectedMenuItem(null)} />
       )}
@@ -786,4 +492,4 @@ const MalawianRestaurantApp = () => {
   );
 };
 
-export default MalawianRestaurantApp; 
+export default MalawianRestaurantApp;
