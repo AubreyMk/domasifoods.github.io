@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useCallback, memo } from 'react';
 import {
-  Search, Home, UtensilsCrossed, Star, MapPin,
-  Clock, Navigation, X, AlertCircle,
+  Search, Home, UtensilsCrossed, Star, MapPin, Navigation, X, AlertCircle,
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
